@@ -27,37 +27,32 @@ mqttClient.on("message", async (topic, message) => {
 	console.log(`Received: ${topic} -> ${data}`);
 
 	const topicParts = topic.split("/");
-	const [prefix, gedung, lokasi, gender, type, nomor] = topicParts;
-
-	const locationRef = db.collection("lokasi").doc(lokasi);
-	const locationDoc = await locationRef.get();
-
-	if (!locationDoc.exists) {
-		await locationRef.set({}, { merge: true });
-		console.log("Location added");
-	}
+	const [prefix, company, gedung, lokasi, gender, type, nomor] = topicParts;
 
 	if (prefix == "sensor") {
 		try {
-			const buildingRef = db.collection("sensor").doc(gedung);
+			const buildingRef = db
+				.collection("sensor")
+				.doc(company)
+				.collection(gender)
+				.doc(gedung);
 
 			if (nomor !== undefined) {
-				const docId = `${lokasi}_${gender}_${nomor}`;
+				const docId = `${gedung}_${lokasi}_${gender}_${nomor}`;
 
-				await buildingRef.set({}, { merge: true });
+				//await sensorRef.set({}, { merge: true });
 
-				const sensorDocRef = buildingRef.collection(type).doc(docId);
-				const sensorSnapshot = await sensorDocRef.get();
+				const sensorRef = buildingRef.collection(type).doc(docId);
+
+				const sensorSnapshot = await sensorRef.get();
 				const previousState = sensorSnapshot.exists
 					? sensorSnapshot.data().status
 					: null;
 
 				if (type == "okupansi" || type == "bau") {
-					await sensorDocRef.set(
+					await sensorRef.set(
 						{
-							gedung,
 							lokasi,
-							gender,
 							nomor,
 							status: data,
 							last_updated: new Date(),
@@ -69,7 +64,7 @@ mqttClient.on("message", async (topic, message) => {
 						type == "okupansi" ||
 						(type == "bau" && previousState == "bad" && data == "good")
 					) {
-						await db.collection("logs").add({
+						await db.collection("logs").doc(company).collection(type).add({
 							type,
 							gedung,
 							lokasi,
@@ -121,47 +116,13 @@ mqttClient.on("message", async (topic, message) => {
 							await doc.ref.delete();
 						});
 					}
-
-					if (type == "bau" && data == "bad") {
-						const notifSnapshot = await db
-							.collection("users")
-							.where("role", "==", "janitor")
-							.where("active", "==", true)
-							.get();
-
-						notifSnapshot.forEach(async (doc) => {
-							const notifData = doc.data();
-							const fcmToken = notifData["fcm_token"];
-
-							const payload = {
-								notification: {
-									title: "Bau Tidak Sedap!",
-									body: `Segera bersihkan toilet pada ${snakeToCapitalized(
-										gedung
-									)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(
-										gender
-									)}) kubikal: ${nomor}`,
-								},
-								token: fcmToken,
-							};
-
-							try {
-								await admin.messaging().send(payload);
-								console.log("Notification sent to:", fcmToken);
-							} catch (err) {
-								console.error("Error sending FCM:", err);
-							}
-						});
-					}
 				} else {
 					const msgPart = data.split(";");
 					const [status, amount] = msgPart;
 
-					await sensorDocRef.set(
+					await sensorRef.set(
 						{
-							gedung,
 							lokasi,
-							gender,
 							nomor,
 							status,
 							amount,
@@ -175,8 +136,7 @@ mqttClient.on("message", async (topic, message) => {
 						previousState === "bad" &&
 						status === "good"
 					) {
-						await db.collection("logs").add({
-							type,
+						await db.collection("logs").doc(company).collection(type).add({
 							gedung,
 							lokasi,
 							gender,
@@ -186,7 +146,6 @@ mqttClient.on("message", async (topic, message) => {
 						});
 					}
 				}
-
 				console.log(`Real time data updated: ${docId}`);
 				console.log("Log saved");
 			} else {
@@ -196,9 +155,7 @@ mqttClient.on("message", async (topic, message) => {
 
 				await buildingRef.collection(type).doc(docId).set(
 					{
-						gedung,
 						lokasi,
-						gender,
 						status: data,
 						last_updated: new Date(),
 					},
@@ -207,8 +164,7 @@ mqttClient.on("message", async (topic, message) => {
 
 				console.log(`Real time data updated: ${docId}`);
 
-				await db.collection("logs").add({
-					type,
+				await db.collection("logs").doc(company).collection(type).add({
 					lokasi,
 					gender,
 					status: data,
@@ -220,12 +176,212 @@ mqttClient.on("message", async (topic, message) => {
 		} catch (err) {
 			console.error("Firestore Error:", err);
 		}
+
+		if (data == "bad") {
+			switch (type) {
+				case "tisu":
+					sendNotification(
+						"Tisu Tersisa Sedikit!",
+						`Segera isi ulang tisu pada ${snakeToCapitalized(
+							gedung
+						)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(
+							gender
+						)}) nomor kubikal: ${nomor}`
+					);
+					break;
+				case "bau":
+					let msg = `Segera bersihkan toilet pada ${snakeToCapitalized(
+						gedung
+					)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(gender)})`;
+					if (nomor < 1000) {
+						msg += `nomor kubikal: ${nomor}`;
+					}
+					sendNotification("Bau Tidak Sedap Terdeteksi!", msg);
+					break;
+				case "sabun":
+					sendNotification(
+						"Sabun Hampir Habis!",
+						`Segera isi ulang sabun pada ${snakeToCapitalized(
+							gedung
+						)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(
+							gender
+						)}) nomor dispenser: ${nomor}`
+					);
+					break;
+				case "baterai":
+					sendNotification(
+						"Baterai Lemah!",
+						`Segera ganti baterai pada ${snakeToCapitalized(
+							gedung
+						)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(
+							gender
+						)}) nomor perangkat: ${nomor}`
+					);
+					break;
+			}
+		}
 	} else if (prefix == "config") {
+		const mac_address = gedung;
+
+		const msgPart = data.split(";");
+		const [
+			building,
+			lokasi,
+			gender,
+			nomor,
+			wifi_ssid,
+			wifi_password,
+			mqtt_server,
+			mqtt_port,
+			mqtt_user,
+			mqtt_password,
+			nomor_toilet,
+			nomor_dispenser,
+			luar,
+			setting_jarak,
+			setting_berat,
+		] = msgPart;
+
+		const gedungRef = db
+			.collection("gedung")
+			.doc(company)
+			.collection("daftar")
+			.doc(building);
+
+		const gedungDoc = await gedungRef.get();
+
+		if (!gedungDoc.exists) {
+			await gedungRef.set(
+				{
+					company,
+				},
+				{ merge: true }
+			);
+			console.log("Gedung added");
+		}
+
+		const locationRef = db
+			.collection("lokasi")
+			.doc(company)
+			.collection(building)
+			.doc(lokasi);
+		const locationDoc = await locationRef.get();
+
+		if (!locationDoc.exists) {
+			await locationRef.set(
+				{
+					company,
+					building,
+				},
+				{ merge: true }
+			);
+			console.log("Location added");
+		}
+
+		const docId = `${building}_${lokasi}_${gender}_${nomor}`;
+		const configRef = db
+			.collection("config")
+			.doc(company)
+			.collection("data")
+			.doc(docId);
+
+		await configRef.set(
+			{
+				gedung: building,
+				lokasi,
+				gender,
+				nomor_perangkat: nomor,
+				mac_address,
+				wifi_ssid,
+				wifi_password,
+				mqtt_server,
+				mqtt_port,
+				mqtt_user,
+				mqtt_password,
+				nomor_toilet,
+				nomor_dispenser,
+				luar,
+				setting_jarak,
+				setting_berat,
+			},
+			{ merge: true }
+		);
 	}
 });
 
 // Handle MQTT errors
 mqttClient.on("error", (err) => console.error("MQTT Error:", err));
+
+async function sendNotification(title, msg) {
+	const notifSnapshot = await db
+		.collection("users")
+		.where("role", "==", "janitor")
+		.where("active", "==", true)
+		.get();
+
+	notifSnapshot.forEach(async (doc) => {
+		const notifData = doc.data();
+		const fcmToken = notifData["fcm_token"];
+
+		const payload = {
+			notification: {
+				title: title,
+				body: msg,
+			},
+			token: fcmToken,
+		};
+
+		try {
+			await admin.messaging().send(payload);
+			console.log("Notification sent to:", fcmToken);
+		} catch (err) {
+			console.error("Error sending FCM:", err);
+		}
+	});
+}
+
+const usageBuffer = new Map();
+
+function updateWriteCount(companyId) {
+	const current = usageBuffer.get(companyId) || {
+		count: 0,
+		lastFlushed: Date.now(),
+	};
+	current.count += 1;
+	usageBuffer.set(companyId, current);
+
+	if (current.count >= 1000) {
+		flushToFirestore(companyId, current.count);
+		usageBuffer.set(companyId, { count: 0, lastFlushed: Date.now() });
+	}
+}
+
+async function flushToFirestore(companyId, count) {
+	const today = new Date().toISOString().split("T")[0];
+	const usageRef = db
+		.collection("usage_metrics")
+		.doc(companyId)
+		.collection("daily")
+		.doc(today);
+	await db.runTransaction(async (t) => {
+		const snapshot = await t.get(usageRef);
+		if (!snapshot.exists) {
+			t.set(usageRef, { writes: 0, reads: 0 });
+		}
+		t.update(usageRef, {
+			writes: admin.firestore.FieldValue.increment(count),
+		});
+	});
+}
+
+setInterval(() => {
+	usageBuffer.forEach((value, companyId) => {
+		if (value.count > 0) {
+			flushToFirestore(companyId, value.count);
+			usageBuffer.set(companyId, { count: 0, lastFlushed: Date.now() });
+		}
+	});
+}, 60 * 60 * 1000);
 
 function snakeToCapitalized(str) {
 	return str
