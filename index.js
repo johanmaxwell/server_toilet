@@ -17,6 +17,65 @@ const mqttClient = mqtt.connect(process.env.MQTT_BROKER_URL, {
 	clientId: "Local_Server",
 });
 
+// Usage buffer for tracking reads and writes
+const usageBuffer = new Map();
+
+function updateUsageCount(companyId, type, count = 1) {
+	const current = usageBuffer.get(companyId) || {
+		reads: 0,
+		writes: 0,
+		lastFlushed: Date.now(),
+	};
+	current[type] += count;
+	usageBuffer.set(companyId, current);
+
+	// Flush if threshold is reached
+	if (current.reads + current.writes >= 2000) {
+		flushToFirestore(companyId, current);
+		usageBuffer.set(companyId, {
+			reads: 0,
+			writes: 0,
+			lastFlushed: Date.now(),
+		});
+	}
+}
+
+async function flushToFirestore(companyId, usage) {
+	const today = new Date().toISOString().split("T")[0];
+	const usageRef = db
+		.collection("usage_metrics")
+		.doc(companyId)
+		.collection("daily")
+		.doc(today);
+	await db.runTransaction(async (t) => {
+		const snapshot = await t.get(usageRef);
+		if (!snapshot.exists) {
+			t.set(usageRef, { reads: 0, writes: 0 });
+		}
+		t.update(usageRef, {
+			reads: admin.firestore.FieldValue.increment(usage.reads),
+			writes: admin.firestore.FieldValue.increment(usage.writes),
+		});
+	});
+	console.log(
+		`Flushed ${usage.reads} reads and ${usage.writes} writes for company: ${companyId}`
+	);
+}
+
+// Periodic flush to avoid data loss
+setInterval(() => {
+	usageBuffer.forEach((value, companyId) => {
+		if (value.reads > 0 || value.writes > 0) {
+			flushToFirestore(companyId, value);
+			usageBuffer.set(companyId, {
+				reads: 0,
+				writes: 0,
+				lastFlushed: Date.now(),
+			});
+		}
+	});
+}, 60 * 60 * 1000);
+
 mqttClient.on("connect", () => {
 	console.log("Connected to MQTT Broker");
 	mqttClient.subscribe("#", { qos: 0 });
@@ -29,7 +88,7 @@ mqttClient.on("message", async (topic, message) => {
 	const topicParts = topic.split("/");
 	const [prefix, company, gedung, lokasi, gender, type, nomor] = topicParts;
 
-	if (prefix == "sensor") {
+	if (prefix === "sensor") {
 		try {
 			const buildingRef = db
 				.collection("sensor")
@@ -39,17 +98,16 @@ mqttClient.on("message", async (topic, message) => {
 
 			if (nomor !== undefined) {
 				const docId = `${gedung}_${lokasi}_${gender}_${nomor}`;
-
-				//await sensorRef.set({}, { merge: true });
-
 				const sensorRef = buildingRef.collection(type).doc(docId);
 
 				const sensorSnapshot = await sensorRef.get();
+				updateUsageCount(company, "reads", sensorSnapshot.exists ? 1 : 0);
+
 				const previousState = sensorSnapshot.exists
 					? sensorSnapshot.data().status
 					: null;
 
-				if (type == "okupansi" || type == "bau") {
+				if (type === "okupansi" || type === "bau") {
 					await sensorRef.set(
 						{
 							lokasi,
@@ -59,10 +117,11 @@ mqttClient.on("message", async (topic, message) => {
 						},
 						{ merge: true }
 					);
+					updateUsageCount(company, "writes");
 
 					if (
-						type == "okupansi" ||
-						(type == "bau" && previousState == "bad" && data == "good")
+						type === "okupansi" ||
+						(type === "bau" && previousState === "bad" && data === "good")
 					) {
 						await db.collection("logs").doc(company).collection(type).add({
 							type,
@@ -73,46 +132,19 @@ mqttClient.on("message", async (topic, message) => {
 							status: data,
 							timestamp: new Date(),
 						});
+						updateUsageCount(company, "writes");
 					}
 
-					if (type == "okupansi" && data == "vacant") {
+					if (type === "okupansi" && data === "vacant") {
 						const notifSnapshot = await db
 							.collection("reminders")
 							.where("gedung", "==", gedung)
 							.where("lokasi", "==", lokasi)
 							.where("gender", "==", gender)
 							.get();
-
-						const sentKeys = new Set();
+						updateUsageCount(company, "reads", notifSnapshot.size);
 
 						notifSnapshot.forEach(async (doc) => {
-							const notifData = doc.data();
-							const fcmToken = notifData.fcmToken;
-							const lokasi = notifData.lokasi;
-							const gender = notifData.gender;
-							const key = `${fcmToken}_${lokasi}_${gender}`;
-
-							if (!sentKeys.has(key)) {
-								sentKeys.add(key);
-
-								const payload = {
-									notification: {
-										title: "Toilet Tersedia",
-										body: `Toilet telah tersedia pada ${snakeToCapitalized(
-											lokasi
-										)} (${snakeToCapitalized(gender)})`,
-									},
-									token: fcmToken,
-								};
-
-								try {
-									await admin.messaging().send(payload);
-									console.log("Notification sent to:", fcmToken);
-								} catch (err) {
-									console.error("Error sending FCM:", err);
-								}
-							}
-
 							await doc.ref.delete();
 						});
 					}
@@ -130,9 +162,10 @@ mqttClient.on("message", async (topic, message) => {
 						},
 						{ merge: true }
 					);
+					updateUsageCount(company, "writes");
 
 					if (
-						(type == "sabun" || type == "tisu") &&
+						(type === "sabun" || type === "tisu") &&
 						previousState === "bad" &&
 						status === "good"
 					) {
@@ -144,14 +177,16 @@ mqttClient.on("message", async (topic, message) => {
 							status,
 							timestamp: new Date(),
 						});
+						updateUsageCount(company, "writes");
 					}
 				}
-				console.log(`Real time data updated: ${docId}`);
+				console.log(`Real-time data updated: ${docId}`);
 				console.log("Log saved");
 			} else {
 				const docId = `${lokasi}_${gender}`;
 
 				await buildingRef.set({}, { merge: true });
+				updateUsageCount(company, "writes");
 
 				await buildingRef.collection(type).doc(docId).set(
 					{
@@ -161,8 +196,7 @@ mqttClient.on("message", async (topic, message) => {
 					},
 					{ merge: true }
 				);
-
-				console.log(`Real time data updated: ${docId}`);
+				updateUsageCount(company, "writes");
 
 				await db.collection("logs").doc(company).collection(type).add({
 					lokasi,
@@ -170,57 +204,15 @@ mqttClient.on("message", async (topic, message) => {
 					status: data,
 					timestamp: new Date(),
 				});
+				updateUsageCount(company, "writes");
 
+				console.log(`Real-time data updated: ${docId}`);
 				console.log("Log saved");
 			}
 		} catch (err) {
 			console.error("Firestore Error:", err);
 		}
-
-		if (data == "bad") {
-			switch (type) {
-				case "tisu":
-					sendNotification(
-						"Tisu Tersisa Sedikit!",
-						`Segera isi ulang tisu pada ${snakeToCapitalized(
-							gedung
-						)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(
-							gender
-						)}) nomor kubikal: ${nomor}`
-					);
-					break;
-				case "bau":
-					let msg = `Segera bersihkan toilet pada ${snakeToCapitalized(
-						gedung
-					)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(gender)})`;
-					if (nomor < 1000) {
-						msg += `nomor kubikal: ${nomor}`;
-					}
-					sendNotification("Bau Tidak Sedap Terdeteksi!", msg);
-					break;
-				case "sabun":
-					sendNotification(
-						"Sabun Hampir Habis!",
-						`Segera isi ulang sabun pada ${snakeToCapitalized(
-							gedung
-						)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(
-							gender
-						)}) nomor dispenser: ${nomor}`
-					);
-					break;
-				case "baterai":
-					sendNotification(
-						"Baterai Lemah!",
-						`Segera ganti baterai pada ${snakeToCapitalized(
-							gedung
-						)} di ${snakeToCapitalized(lokasi)} (${snakeToCapitalized(
-							gender
-						)}) nomor perangkat: ${nomor}`
-					);
-					break;
-			}
-		}
-	} else if (prefix == "config") {
+	} else if (prefix === "config") {
 		const mac_address = gedung;
 
 		const msgPart = data.split(";");
@@ -248,35 +240,30 @@ mqttClient.on("message", async (topic, message) => {
 			.collection("daftar")
 			.doc(building);
 
-		const gedungDoc = await gedungRef.get();
-
-		if (!gedungDoc.exists) {
-			await gedungRef.set(
-				{
-					company,
-				},
-				{ merge: true }
-			);
-			console.log("Gedung added");
-		}
+		await gedungRef.set(
+			{
+				company,
+			},
+			{ merge: true }
+		);
+		updateUsageCount(company, "writes");
+		console.log("Gedung added");
 
 		const locationRef = db
 			.collection("lokasi")
 			.doc(company)
 			.collection(building)
 			.doc(lokasi);
-		const locationDoc = await locationRef.get();
 
-		if (!locationDoc.exists) {
-			await locationRef.set(
-				{
-					company,
-					building,
-				},
-				{ merge: true }
-			);
-			console.log("Location added");
-		}
+		await locationRef.set(
+			{
+				company,
+				building,
+			},
+			{ merge: true }
+		);
+		updateUsageCount(company, "writes");
+		console.log("Location added");
 
 		const docId = `${building}_${lokasi}_${gender}_${nomor}`;
 		const configRef = db
@@ -306,6 +293,7 @@ mqttClient.on("message", async (topic, message) => {
 			},
 			{ merge: true }
 		);
+		updateUsageCount(company, "writes");
 	}
 });
 
@@ -318,6 +306,7 @@ async function sendNotification(title, msg) {
 		.where("role", "==", "janitor")
 		.where("active", "==", true)
 		.get();
+	updateUsageCount(company, "reads", notifSnapshot.size);
 
 	notifSnapshot.forEach(async (doc) => {
 		const notifData = doc.data();
@@ -339,49 +328,6 @@ async function sendNotification(title, msg) {
 		}
 	});
 }
-
-const usageBuffer = new Map();
-
-function updateWriteCount(companyId) {
-	const current = usageBuffer.get(companyId) || {
-		count: 0,
-		lastFlushed: Date.now(),
-	};
-	current.count += 1;
-	usageBuffer.set(companyId, current);
-
-	if (current.count >= 1000) {
-		flushToFirestore(companyId, current.count);
-		usageBuffer.set(companyId, { count: 0, lastFlushed: Date.now() });
-	}
-}
-
-async function flushToFirestore(companyId, count) {
-	const today = new Date().toISOString().split("T")[0];
-	const usageRef = db
-		.collection("usage_metrics")
-		.doc(companyId)
-		.collection("daily")
-		.doc(today);
-	await db.runTransaction(async (t) => {
-		const snapshot = await t.get(usageRef);
-		if (!snapshot.exists) {
-			t.set(usageRef, { writes: 0, reads: 0 });
-		}
-		t.update(usageRef, {
-			writes: admin.firestore.FieldValue.increment(count),
-		});
-	});
-}
-
-setInterval(() => {
-	usageBuffer.forEach((value, companyId) => {
-		if (value.count > 0) {
-			flushToFirestore(companyId, value.count);
-			usageBuffer.set(companyId, { count: 0, lastFlushed: Date.now() });
-		}
-	});
-}, 60 * 60 * 1000);
 
 function snakeToCapitalized(str) {
 	return str
