@@ -88,6 +88,22 @@ mqttClient.on("message", async (topic, message) => {
 	const topicParts = topic.split("/");
 	const [prefix, company, gedung, lokasi, gender, type, nomor] = topicParts;
 
+	if (prefix != "sensor" && prefix != "config") {
+		return;
+	}
+
+	const companyDoc = await db.collection("company").doc(company).get();
+	if (!companyDoc.exists) {
+		console.log(`Company '${company}' not found.`);
+		return;
+	}
+
+	const companyData = companyDoc.data();
+	if (companyData.is_deactivated === true) {
+		console.log(`Company '${company}' is deactivated. Ignoring data.`);
+		return;
+	}
+
 	if (prefix === "sensor") {
 		try {
 			const buildingRef = db
@@ -108,11 +124,14 @@ mqttClient.on("message", async (topic, message) => {
 					: null;
 
 				if (type === "okupansi" || type === "bau") {
+					const msgPart = data.split(";");
+					const [status, nomor_tipe] = msgPart;
+
 					await sensorRef.set(
 						{
 							lokasi,
-							nomor,
-							status: data,
+							nomor: nomor_tipe,
+							status,
 							last_updated: new Date(),
 						},
 						{ merge: true }
@@ -150,12 +169,12 @@ mqttClient.on("message", async (topic, message) => {
 					}
 				} else {
 					const msgPart = data.split(";");
-					const [status, amount] = msgPart;
+					const [status, amount, nomor_tipe] = msgPart;
 
 					await sensorRef.set(
 						{
 							lokasi,
-							nomor,
+							nomor: nomor_tipe,
 							status,
 							amount,
 							last_updated: new Date(),
@@ -217,28 +236,33 @@ mqttClient.on("message", async (topic, message) => {
 
 		const msgPart = data.split(";");
 		const [
-			building,
+			gedung,
 			lokasi,
 			gender,
-			nomor,
+			nomor_perangkat,
 			wifi_ssid,
 			wifi_password,
 			mqtt_server,
 			mqtt_port,
 			mqtt_user,
 			mqtt_password,
+			okupansi,
+			pengunjung,
+			tisu,
+			sabun,
+			bau,
 			nomor_toilet,
 			nomor_dispenser,
-			luar,
-			setting_jarak,
-			setting_berat,
+			is_luar,
+			jarak_deteksi,
+			berat_tisu,
 		] = msgPart;
 
 		const gedungRef = db
 			.collection("gedung")
 			.doc(company)
 			.collection("daftar")
-			.doc(building);
+			.doc(gedung);
 
 		await gedungRef.set(
 			{
@@ -252,32 +276,32 @@ mqttClient.on("message", async (topic, message) => {
 		const locationRef = db
 			.collection("lokasi")
 			.doc(company)
-			.collection(building)
+			.collection(gedung)
 			.doc(lokasi);
 
 		await locationRef.set(
 			{
 				company,
-				building,
+				gedung,
 			},
 			{ merge: true }
 		);
 		updateUsageCount(company, "writes");
 		console.log("Location added");
 
-		const docId = `${building}_${lokasi}_${gender}_${nomor}`;
-		const configRef = db
-			.collection("config")
-			.doc(company)
-			.collection("data")
-			.doc(docId);
+		const docId = `${gedung}_${lokasi}_${gender}_${nomor_perangkat}`;
+		const configParentRef = db.collection("config").doc(company);
+		await configParentRef.set({}, { merge: true });
+
+		const configRef = configParentRef.collection(gender).doc(docId);
 
 		await configRef.set(
 			{
-				gedung: building,
+				company,
+				gedung,
 				lokasi,
 				gender,
-				nomor_perangkat: nomor,
+				nomor_perangkat,
 				mac_address,
 				wifi_ssid,
 				wifi_password,
@@ -285,11 +309,17 @@ mqttClient.on("message", async (topic, message) => {
 				mqtt_port,
 				mqtt_user,
 				mqtt_password,
+				okupansi,
+				pengunjung,
+				tisu,
+				sabun,
+				bau,
 				nomor_toilet,
 				nomor_dispenser,
-				luar,
-				setting_jarak,
-				setting_berat,
+				is_luar,
+				jarak_deteksi,
+				berat_tisu,
+				version: 1,
 			},
 			{ merge: true }
 		);
@@ -335,3 +365,63 @@ function snakeToCapitalized(str) {
 		.map((word) => word.charAt(0).toUpperCase() + word.slice(1))
 		.join(" ");
 }
+
+//Send MQTT messsage on config update
+function publishConfigUpdate(companyId, configData) {
+	const macAddress = configData.mac_address;
+	const topic = `update/${companyId}/${macAddress}`;
+	const message = JSON.stringify(configData);
+
+	mqttClient.publish(topic, message, { qos: 0, retain: true }, (err) => {
+		if (err) {
+			console.error(`Failed to publish config for ${companyId}:`, err);
+		} else {
+			console.log(`Published config update to ${topic}`);
+		}
+	});
+}
+
+function attachConfigListener(companyId) {
+	const subcollections = ["pria", "wanita"];
+
+	subcollections.forEach((subcollection) => {
+		const configRef = db
+			.collection("config")
+			.doc(companyId)
+			.collection(subcollection);
+
+		configRef.onSnapshot((snapshot) => {
+			snapshot.docChanges().forEach((change) => {
+				if (change.type === "added" || change.type === "modified") {
+					const configData = change.doc.data();
+					publishConfigUpdate(companyId, configData);
+				}
+			});
+		});
+
+		console.log(
+			`Listener attached for company: ${companyId}, subcollection: ${subcollection}`
+		);
+	});
+}
+
+function monitorCompanies() {
+	const configCollection = db.collection("config");
+
+	configCollection.get().then((snapshot) => {
+		snapshot.forEach((doc) => {
+			console.log(doc.id);
+			attachConfigListener(doc.id);
+		});
+	});
+
+	configCollection.onSnapshot((snapshot) => {
+		snapshot.docChanges().forEach((change) => {
+			if (change.type === "added") {
+				attachConfigListener(change.doc.id);
+			}
+		});
+	});
+}
+
+monitorCompanies();
